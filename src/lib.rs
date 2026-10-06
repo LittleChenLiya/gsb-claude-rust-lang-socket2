@@ -172,6 +172,7 @@ macro_rules! man_links {
     };
 }
 
+mod config;
 mod sockaddr;
 mod socket;
 mod sockref;
@@ -188,6 +189,7 @@ compile_error!("Socket2 doesn't support the compile target");
 
 use sys::c_int;
 
+pub use config::SocketConfig;
 pub use sockaddr::{sa_family_t, socklen_t, SockAddr, SockAddrStorage};
 #[cfg(not(any(
     target_os = "haiku",

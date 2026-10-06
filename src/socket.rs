@@ -23,6 +23,8 @@ use std::time::Duration;
 use crate::sys::{self, c_int, getsockopt, setsockopt, Bool};
 #[cfg(all(unix, not(any(target_os = "redox", target_os = "horizon"))))]
 use crate::MsgHdrMut;
+#[cfg(unix)]
+use crate::SocketConfig;
 use crate::{Domain, Protocol, SockAddr, TcpKeepalive, Type};
 #[cfg(not(any(target_os = "redox", target_os = "wasi", target_os = "horizon")))]
 use crate::{MaybeUninitSlice, MsgHdr, RecvFlags};
@@ -383,6 +385,42 @@ impl Socket {
     /// `FIONBIO`.
     pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
         sys::set_nonblocking(self.as_raw(), nonblocking)
+    }
+
+    /// Configures multiple socket options transactionally.
+    ///
+    /// The original state of every configured option is queried before any
+    /// setter is called. If a setter fails, only the options that were
+    /// already changed are rolled back to their original values; options that
+    /// were not configured are left untouched. The borrowed socket is never
+    /// closed.
+    ///
+    /// The transaction is only supported on platforms where the original state
+    /// of every configured option can be queried. On platforms where a field
+    /// cannot be queried (e.g. nonblocking mode on Windows) this method is not
+    /// available.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(unix)]
+    /// # fn main() -> std::io::Result<()> {
+    /// use std::time::Duration;
+    /// use socket2::{Socket, SocketConfig, Domain, Type};
+    ///
+    /// let socket = Socket::new(Domain::IPV4, Type::STREAM, None)?;
+    /// let config = SocketConfig::new()
+    ///     .with_nonblocking(true)
+    ///     .with_read_timeout(Some(Duration::from_secs(1)));
+    /// socket.configure(&config)?;
+    /// # Ok(())
+    /// # }
+    /// # #[cfg(not(unix))]
+    /// # fn main() {}
+    /// ```
+    #[cfg(unix)]
+    pub fn configure(&self, config: &SocketConfig) -> io::Result<()> {
+        config::configure_with(self.as_raw(), config, &config::RealOps)
     }
 
     /// Shuts down the read, write, or both halves of this connection.
