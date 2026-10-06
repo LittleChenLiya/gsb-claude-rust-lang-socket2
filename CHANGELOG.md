@@ -1,5 +1,8 @@
 # 0.6.5
 
+* Add a safe, strictly IPv6 constructor `SockAddr::try_from_ipv6`, which
+  verifies the address family and actual byte length, rejecting truncated
+  inputs and wrong families instead of reinterpreting a half address.
 * Add support for Emscripten (wasm32)
   (https://github.com/rust-lang/socket2/pull/660).
 * Add support for NuttX

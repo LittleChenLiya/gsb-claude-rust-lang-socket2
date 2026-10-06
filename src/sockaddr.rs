@@ -236,6 +236,97 @@ impl SockAddr {
         crate::sys::iucv_sockaddr(userid, name)
     }
 
+    /// Converts raw address storage into a [`SockAddr`], but only when it
+    /// contains a complete, strictly IPv6 (`AF_INET6`) address.
+    ///
+    /// Unlike the unsafe [`SockAddr::new`], this verifies both the address
+    /// family of `storage` and the actual byte length `len` before creating a
+    /// `SockAddr`:
+    ///
+    /// * `storage.ss_family` must be `AF_INET6`, and
+    /// * `len` must be at least the size of a full `sockaddr_in6` (and no
+    ///   larger than the storage itself).
+    ///
+    /// If either check fails an [`io::Error`] with kind
+    /// [`io::ErrorKind::InvalidInput`] is returned. In that case no `SockAddr`
+    /// is created, so a truncated address is never reinterpreted into a (half
+    /// initialised) address. The port, flow info and scope ID of a valid
+    /// address are preserved verbatim.
+    ///
+    /// This only accepts IPv6 addresses. Unix socket paths and addresses with
+    /// an unknown family are not given a new representation; use
+    /// `SockAddr::unix` (on platforms that support it) or [`SockAddr::new`]
+    /// for those.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> std::io::Result<()> {
+    /// use std::net::{Ipv6Addr, SocketAddrV6};
+    ///
+    /// use socket2::SockAddr;
+    ///
+    /// let original = SockAddr::from(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 8080, 0, 2));
+    /// // A complete address, e.g. as initialised by `recvfrom(2)`.
+    /// let len = original.len();
+    /// let storage = original.as_storage();
+    /// let address = SockAddr::try_from_ipv6(storage, len)?;
+    /// assert!(address.is_ipv6());
+    /// assert_eq!(address.as_socket_ipv6().unwrap().port(), 8080);
+    /// assert_eq!(address.as_socket_ipv6().unwrap().scope_id(), 2);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn try_from_ipv6(storage: SockAddrStorage, len: socklen_t) -> io::Result<SockAddr> {
+        let storage = storage.storage;
+
+        // First verify the family. Reading `ss_family` is always valid as it is
+        // the first field of the storage, independent of `len`.
+        if storage.ss_family != AF_INET6 as sa_family_t {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "address family is not AF_INET6",
+            ));
+        }
+
+        // Then verify the actual byte length covers a full `sockaddr_in6`
+        // instead of forcing a shorter buffer into the address type. Negative
+        // lengths and lengths larger than the storage are also rejected.
+        if !(size_of::<sockaddr_in6>()..=size_of::<sockaddr_storage>())
+            .contains(&usize::try_from(len).unwrap_or(usize::MAX))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "address length does not match a sockaddr_in6",
+            ));
+        }
+
+        // Canonicalise the length to exactly `sockaddr_in6`, matching
+        // `From<SocketAddrV6>`, so any trailing storage bytes are ignored.
+        let len = size_of::<sockaddr_in6>() as socklen_t;
+        #[cfg(any(
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "haiku",
+            target_os = "hermit",
+            target_os = "ios",
+            target_os = "visionos",
+            target_os = "macos",
+            target_os = "netbsd",
+            target_os = "nto",
+            target_os = "openbsd",
+            target_os = "tvos",
+            target_os = "vxworks",
+            target_os = "watchos",
+        ))]
+        let storage = {
+            let mut storage = storage;
+            storage.ss_len = len as u8;
+            storage
+        };
+        Ok(SockAddr { storage, len })
+    }
+
     /// Set the length of the address.
     ///
     /// # Safety
@@ -549,6 +640,86 @@ mod tests {
             assert!(addr.as_pathname().is_none());
             assert!(addr.as_abstract_namespace().is_none());
         }
+    }
+
+    #[test]
+    fn try_from_ipv6_valid_roundtrip() {
+        use std::net::Ipv6Addr;
+
+        // A valid, fully initialised IPv6 address, including port and scope id.
+        let ip = Ipv6Addr::new(0xfe80, 0, 0, 0, 0x1234, 0x5678, 0x9abc, 0xdef0);
+        let std = SocketAddrV6::new(ip, 443, 0, 42);
+        let original = SockAddr::from(std);
+
+        // Simulate storage + length as returned by e.g. `recvfrom(2)`.
+        let len = original.len();
+        let storage = original.as_storage();
+
+        let addr = SockAddr::try_from_ipv6(storage, len).unwrap();
+        assert!(addr.is_ipv6());
+        assert!(!addr.is_ipv4());
+        assert_eq!(addr.family(), AF_INET6 as sa_family_t);
+        assert_eq!(addr.domain(), Domain::IPV6);
+        assert_eq!(addr.len(), size_of::<sockaddr_in6>() as socklen_t);
+
+        // Port, flow info and scope id round-trip unchanged.
+        assert_eq!(addr.as_socket(), Some(SocketAddr::V6(std)));
+        assert_eq!(addr.as_socket_ipv6(), Some(std));
+        let socket = addr.as_socket_ipv6().unwrap();
+        assert_eq!(socket.ip(), &ip);
+        assert_eq!(socket.port(), 443);
+        assert_eq!(socket.flowinfo(), 0);
+        assert_eq!(socket.scope_id(), 42);
+
+        // The result is byte-for-byte equal to a canonical `SockAddr`.
+        assert_eq!(addr, SockAddr::from(std));
+    }
+
+    #[test]
+    fn try_from_ipv6_rejects_short_input() {
+        use std::io::ErrorKind;
+        use std::net::Ipv6Addr;
+
+        let std = SocketAddrV6::new(Ipv6Addr::LOCALHOST, 80, 0, 1);
+        let original = SockAddr::from(std);
+
+        // Truncated IPv6 inputs must be rejected rather than forcibly cast;
+        // no `SockAddr` (and thus no half address) is ever produced.
+        for short_len in [0, 2, 4, 8, 16, size_of::<sockaddr_in6>() as socklen_t - 1] {
+            let storage = original.clone().as_storage();
+            let result = SockAddr::try_from_ipv6(storage, short_len);
+            assert_eq!(
+                result.unwrap_err().kind(),
+                ErrorKind::InvalidInput,
+                "unexpectedly accepted length {short_len}"
+            );
+        }
+
+        // A length larger than the storage itself is rejected as well.
+        let oversized = size_of::<sockaddr_storage>() as socklen_t + 1;
+        let result = SockAddr::try_from_ipv6(original.as_storage(), oversized);
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn try_from_ipv6_rejects_wrong_family() {
+        use std::io::ErrorKind;
+        use std::net::Ipv4Addr;
+
+        // An actually-initialised IPv4 address is not reinterpreted as IPv6.
+        let v4 = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 8080);
+        let v4_addr = SockAddr::from(v4);
+        let len = v4_addr.len();
+        let result = SockAddr::try_from_ipv6(v4_addr.as_storage(), len);
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::InvalidInput);
+
+        // Unknown (zeroed) family with an otherwise IPv6-sized buffer is also
+        // rejected instead of being given a new representation.
+        let result = SockAddr::try_from_ipv6(
+            SockAddrStorage::zeroed(),
+            size_of::<sockaddr_in6>() as socklen_t,
+        );
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::InvalidInput);
     }
 
     #[test]
