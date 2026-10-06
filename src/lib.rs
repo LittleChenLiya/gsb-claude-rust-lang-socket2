@@ -176,6 +176,8 @@ mod sockaddr;
 mod socket;
 mod sockref;
 
+mod config_txn;
+
 #[cfg_attr(
     any(unix, all(target_os = "wasi", not(target_env = "p1"))),
     path = "sys/unix.rs"
@@ -188,6 +190,11 @@ compile_error!("Socket2 doesn't support the compile target");
 
 use sys::c_int;
 
+#[cfg(all(unix, not(target_os = "vita")))]
+pub use config_txn::UnixBackend;
+#[cfg(not(all(unix, not(target_os = "vita"))))]
+pub use config_txn::UnsupportedBackend;
+pub use config_txn::{ConfigBackend, ConfigTxnError, SocketConfigTxn, TimeoutKind};
 pub use sockaddr::{sa_family_t, socklen_t, SockAddr, SockAddrStorage};
 #[cfg(not(any(
     target_os = "haiku",
