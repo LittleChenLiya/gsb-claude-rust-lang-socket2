@@ -223,6 +223,81 @@ impl SockAddr {
         crate::sys::unix_sockaddr(path.as_ref())
     }
 
+    /// Constructs a `SockAddr` from the raw bytes of an IPv6 socket address.
+    ///
+    /// `bytes` must be the raw representation of a `sockaddr_in6` structure:
+    /// its length must be exactly `size_of::<sockaddr_in6>()` and its address
+    /// family (`sin6_family`) must be `AF_INET6`. The port (`sin6_port`), flow
+    /// info (`sin6_flowinfo`) and scope id (`sin6_scope_id`) are preserved
+    /// as-is.
+    ///
+    /// This constructor only deals with IPv6 addresses; it does not handle
+    /// Unix socket paths or any other address family.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `bytes` is too short or too long to be a
+    /// `sockaddr_in6`, or if its address family is not `AF_INET6`. In
+    /// particular a short input is rejected rather than padded or truncated.
+    pub fn ipv6_from_bytes(bytes: &[u8]) -> io::Result<SockAddr> {
+        let expected = size_of::<sockaddr_in6>();
+        if bytes.len() != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid IPv6 socket address length",
+            ));
+        }
+
+        // Read the family without requiring `bytes` to be aligned for
+        // `sockaddr_in6`.
+        // SAFETY: `bytes` has the same length as `sockaddr_in6`, so the family
+        // field is within the buffer.
+        let family = unsafe {
+            let addr = bytes.as_ptr().cast::<sockaddr_in6>();
+            ptr::addr_of!((*addr).sin6_family).read_unaligned()
+        };
+        if family != AF_INET6 as sa_family_t {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "address family is not AF_INET6",
+            ));
+        }
+
+        // SAFETY: `sockaddr_storage` is valid for all zeros and large enough to
+        // hold a `sockaddr_in6`. The family and length are verified above, so
+        // copying the bytes into the storage produces a valid `sockaddr_in6`.
+        let mut storage = unsafe { mem::zeroed::<sockaddr_storage>() };
+        unsafe {
+            ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                &mut storage as *mut sockaddr_storage as *mut u8,
+                bytes.len(),
+            );
+        }
+        #[cfg(any(
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "haiku",
+            target_os = "hermit",
+            target_os = "ios",
+            target_os = "visionos",
+            target_os = "macos",
+            target_os = "netbsd",
+            target_os = "nto",
+            target_os = "openbsd",
+            target_os = "tvos",
+            target_os = "vxworks",
+            target_os = "watchos",
+        ))]
+        {
+            storage.ss_len = expected as u8;
+        }
+        Ok(SockAddr {
+            storage,
+            len: expected as socklen_t,
+        })
+    }
+
     /// Constructs a `SockAddr` with the family `AF_IUCV` and the provided
     /// components.
     ///
@@ -549,6 +624,79 @@ mod tests {
             assert!(addr.as_pathname().is_none());
             assert!(addr.as_abstract_namespace().is_none());
         }
+    }
+
+    /// Build raw `sockaddr_in6` bytes from a `SocketAddrV6`.
+    fn raw_ipv6_bytes(addr: &SocketAddrV6) -> Vec<u8> {
+        let mut sa = unsafe { mem::zeroed::<sockaddr_in6>() };
+        sa.sin6_family = AF_INET6 as sa_family_t;
+        sa.sin6_port = addr.port().to_be();
+        sa.sin6_addr = crate::sys::to_in6_addr(addr.ip());
+        sa.sin6_flowinfo = addr.flowinfo();
+        #[cfg(any(unix, all(target_os = "wasi", not(target_env = "p1"))))]
+        {
+            sa.sin6_scope_id = addr.scope_id();
+        }
+        #[cfg(windows)]
+        {
+            sa.Anonymous = SOCKADDR_IN6_0 {
+                sin6_scope_id: addr.scope_id(),
+            };
+        }
+        let len = size_of::<sockaddr_in6>();
+        let mut bytes = vec![0u8; len];
+        // SAFETY: `sa` is a valid `sockaddr_in6` and `bytes` has the same length.
+        unsafe {
+            ptr::copy_nonoverlapping(ptr::addr_of!(sa).cast::<u8>(), bytes.as_mut_ptr(), len);
+        }
+        bytes
+    }
+
+    #[test]
+    fn ipv6_from_bytes() {
+        use std::net::Ipv6Addr;
+
+        let original = SocketAddrV6::new(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            8080,
+            0x1234_5678,
+            42,
+        );
+
+        // 1. Valid full-length input round-trips, preserving port and scope id.
+        let bytes = raw_ipv6_bytes(&original);
+        assert_eq!(bytes.len(), size_of::<sockaddr_in6>());
+        let addr = SockAddr::ipv6_from_bytes(&bytes).expect("valid IPv6 bytes");
+        assert!(addr.is_ipv6());
+        assert!(!addr.is_ipv4());
+        #[cfg(not(target_os = "wasi"))]
+        assert!(!addr.is_unix());
+        assert_eq!(addr.family(), AF_INET6 as sa_family_t);
+        assert_eq!(addr.len(), size_of::<sockaddr_in6>() as socklen_t);
+        assert_eq!(addr.as_socket(), Some(SocketAddr::V6(original)));
+        assert_eq!(addr.as_socket_ipv6(), Some(original));
+        assert!(addr.as_socket_ipv4().is_none());
+
+        // 2. Short input is rejected (no coercion / half address).
+        let short = &bytes[..size_of::<sockaddr_in6>() - 1];
+        assert!(SockAddr::ipv6_from_bytes(short).is_err());
+        // Empty input is also rejected.
+        assert!(SockAddr::ipv6_from_bytes(&[]).is_err());
+
+        // 3. Wrong family is rejected even with the correct length.
+        let wrong_family = {
+            let mut sa = unsafe { mem::zeroed::<sockaddr_in6>() };
+            sa.sin6_family = AF_INET as sa_family_t;
+            let len = size_of::<sockaddr_in6>();
+            let mut bytes = vec![0u8; len];
+            // SAFETY: `sa` is a valid `sockaddr_in6` and `bytes` has the same length.
+            unsafe {
+                ptr::copy_nonoverlapping(ptr::addr_of!(sa).cast::<u8>(), bytes.as_mut_ptr(), len);
+            }
+            bytes
+        };
+        assert_eq!(wrong_family.len(), size_of::<sockaddr_in6>());
+        assert!(SockAddr::ipv6_from_bytes(&wrong_family).is_err());
     }
 
     #[test]
