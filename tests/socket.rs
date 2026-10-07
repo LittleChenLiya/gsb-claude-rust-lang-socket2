@@ -580,6 +580,60 @@ fn connect_timeout_valid() {
         .unwrap();
 }
 
+/// Regression check for the original `Socket::connect` interface and the new
+/// `Socket::connect_diagnostic`: both hit a loopback port with no listener
+/// and must report the same underlying OS error code, while the diagnostic
+/// additionally retains a copy of the target address and the operation name.
+#[test]
+fn connect_diagnostic_refused() {
+    // Bind and drop a socket to track down a "probably unassigned" port.
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    let addr = "127.0.0.1:0".parse::<SocketAddr>().unwrap().into();
+    socket.bind(&addr).unwrap();
+    let addr = socket.local_addr().unwrap();
+    drop(socket);
+
+    // Original interface: plain `io::Error` with the OS error code.
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    let plain = socket.connect(&addr).unwrap_err();
+    assert_eq!(plain.kind(), io::ErrorKind::ConnectionRefused);
+
+    // Diagnostic interface: same OS error code, plus target copy and op name.
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    let err = socket.connect_diagnostic(&addr).unwrap_err();
+    assert_eq!(err.operation(), "connect");
+    assert_eq!(err.address(), &addr);
+    assert_eq!(err.raw_os_error(), plain.raw_os_error());
+    assert_eq!(err.io_error().kind(), plain.kind());
+    // A refused connect is a final failure, not an in-progress one.
+    assert!(!err.is_in_progress());
+    // The original `io::Error` is recovered unchanged.
+    assert_eq!(err.into_inner().raw_os_error(), plain.raw_os_error());
+}
+
+/// A successful `connect_diagnostic` performs exactly one `connect(2)` call:
+/// no retry and no extra connection is attempted.
+#[test]
+fn connect_diagnostic_single_attempt() {
+    let listener = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    listener
+        .bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+        .unwrap();
+    listener.listen(4).unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    socket.connect_diagnostic(&addr).unwrap();
+
+    // Exactly one pending connection: the diagnostic call did not retry.
+    let (_accepted, _) = listener.accept().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    match listener.accept() {
+        Err(err) => assert_eq!(err.kind(), io::ErrorKind::WouldBlock),
+        Ok(_) => panic!("unexpected second connection"),
+    }
+}
+
 #[test]
 #[cfg(all(feature = "all", unix))]
 fn pair() {

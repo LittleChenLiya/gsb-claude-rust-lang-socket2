@@ -193,6 +193,24 @@ impl Socket {
         sys::connect(self.as_raw(), address)
     }
 
+    /// Initiate a connection on this socket to the specified address,
+    /// returning diagnostic information about the target on failure.
+    ///
+    /// This behaves exactly like [`Socket::connect`]: it performs a single
+    /// `connect(2)` call, does not retry, and does not change any socket
+    /// options. On failure the returned [`ConnectError`] keeps a copy of the
+    /// target `address` and the operation name next to the original
+    /// [`io::Error`], so the underlying OS error code remains available via
+    /// [`ConnectError::raw_os_error`].
+    ///
+    /// A non-blocking connect that is still in progress keeps its original
+    /// `WouldBlock`/`EINPROGRESS` error and is *not* reported as a final
+    /// failure; use [`ConnectError::is_in_progress`] to detect that case.
+    pub fn connect_diagnostic(&self, address: &SockAddr) -> Result<(), ConnectError> {
+        self.connect(address)
+            .map_err(|error| ConnectError::new("connect", address.clone(), error))
+    }
+
     /// Initiate a connection on this socket to the specified address, only
     /// only waiting for a certain period of time for the connection to be
     /// established.
@@ -738,6 +756,97 @@ impl Socket {
     #[cfg(not(any(target_os = "redox", target_os = "wasi", target_os = "horizon")))]
     pub fn sendmsg(&self, msg: &MsgHdr<'_, '_, '_>, flags: sys::c_int) -> io::Result<usize> {
         sys::sendmsg(self.as_raw(), msg, flags)
+    }
+}
+
+/// Diagnostic information about a failed [`Socket::connect`] call.
+///
+/// Returned by [`Socket::connect_diagnostic`]. Retains a copy of the target
+/// address and the operation name while keeping the original [`io::Error`]
+/// (including its OS error code) accessible. The diagnostic is purely
+/// informational: no retry is attempted and no socket option is changed.
+#[derive(Debug)]
+pub struct ConnectError {
+    /// Name of the failed operation, e.g. `"connect"`.
+    operation: &'static str,
+    /// Copy of the target address the operation failed to connect to.
+    address: SockAddr,
+    /// Underlying I/O error as returned by the OS.
+    error: io::Error,
+}
+
+impl ConnectError {
+    pub(crate) fn new(
+        operation: &'static str,
+        address: SockAddr,
+        error: io::Error,
+    ) -> ConnectError {
+        ConnectError {
+            operation,
+            address,
+            error,
+        }
+    }
+
+    /// Returns the name of the failed operation, e.g. `"connect"`.
+    pub fn operation(&self) -> &'static str {
+        self.operation
+    }
+
+    /// Returns a copy of the target address the operation failed to connect
+    /// to.
+    pub fn address(&self) -> &SockAddr {
+        &self.address
+    }
+
+    /// Returns the underlying I/O error as returned by the OS.
+    pub fn io_error(&self) -> &io::Error {
+        &self.error
+    }
+
+    /// Returns the raw OS error code of the underlying error, if any.
+    ///
+    /// This is a shorthand for `self.io_error().raw_os_error()`.
+    pub fn raw_os_error(&self) -> Option<i32> {
+        self.error.raw_os_error()
+    }
+
+    /// Returns `true` if the error indicates a non-blocking connect that is
+    /// still in progress (`WouldBlock`/`EINPROGRESS`), i.e. not a final
+    /// failure.
+    pub fn is_in_progress(&self) -> bool {
+        if self.error.kind() == io::ErrorKind::WouldBlock {
+            return true;
+        }
+        #[cfg(any(unix, all(target_os = "wasi", not(target_env = "p1"))))]
+        {
+            self.error.raw_os_error() == Some(libc::EINPROGRESS)
+        }
+        #[cfg(not(any(unix, all(target_os = "wasi", not(target_env = "p1")))))]
+        {
+            false
+        }
+    }
+
+    /// Consumes the diagnostic, returning the underlying I/O error.
+    pub fn into_inner(self) -> io::Error {
+        self.error
+    }
+}
+
+impl fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} to {:?} failed: {}",
+            self.operation, self.address, self.error
+        )
+    }
+}
+
+impl std::error::Error for ConnectError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
     }
 }
 
@@ -2528,3 +2637,55 @@ from!(net::UdpSocket, Socket);
 from!(Socket, net::TcpStream);
 from!(Socket, net::TcpListener);
 from!(Socket, net::UdpSocket);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    fn target() -> SockAddr {
+        "127.0.0.1:9".parse::<SocketAddr>().unwrap().into()
+    }
+
+    /// Simulated non-blocking in-progress connect: the diagnostic must keep
+    /// the original error semantics and not be misjudged as a final failure.
+    #[test]
+    fn connect_error_in_progress_is_not_final_failure() {
+        let err = ConnectError::new(
+            "connect",
+            target(),
+            io::Error::from(io::ErrorKind::WouldBlock),
+        );
+        assert!(err.is_in_progress());
+        assert_eq!(err.operation(), "connect");
+        assert_eq!(err.address(), &target());
+        assert_eq!(err.io_error().kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[cfg(any(unix, all(target_os = "wasi", not(target_env = "p1"))))]
+    #[test]
+    fn connect_error_einprogress_is_not_final_failure() {
+        let err = ConnectError::new(
+            "connect",
+            target(),
+            io::Error::from_raw_os_error(libc::EINPROGRESS),
+        );
+        assert!(err.is_in_progress());
+        assert_eq!(err.raw_os_error(), Some(libc::EINPROGRESS));
+    }
+
+    #[test]
+    fn connect_error_final_failure_keeps_os_error() {
+        let err = ConnectError::new(
+            "connect",
+            target(),
+            io::Error::from(io::ErrorKind::ConnectionRefused),
+        );
+        assert!(!err.is_in_progress());
+        assert_eq!(err.operation(), "connect");
+        assert_eq!(err.address(), &target());
+        assert_eq!(err.io_error().kind(), io::ErrorKind::ConnectionRefused);
+        // The original `io::Error` is recovered unchanged.
+        assert_eq!(err.into_inner().kind(), io::ErrorKind::ConnectionRefused);
+    }
+}

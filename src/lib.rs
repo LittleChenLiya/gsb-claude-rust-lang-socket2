@@ -198,7 +198,7 @@ pub use sockaddr::{sa_family_t, socklen_t, SockAddr, SockAddrStorage};
     target_os = "wasi",
 )))]
 pub use socket::InterfaceIndexOrAddress;
-pub use socket::Socket;
+pub use socket::{ConnectError, Socket};
 pub use sockref::SockRef;
 #[cfg(all(feature = "all", target_os = "linux"))]
 pub use sys::CcidEndpoints;
