@@ -333,6 +333,42 @@ impl Socket {
         sys::getpeername(self.as_raw())
     }
 
+    /// Returns the socket addresses of both the local half and the remote
+    /// peer of this socket as a single paired snapshot.
+    ///
+    /// This function directly corresponds to calling `getsockname(2)` and
+    /// `getpeername(2)` on Windows and Unix, see [`local_addr`] and
+    /// [`peer_addr`].
+    ///
+    /// [`local_addr`]: Socket::local_addr
+    /// [`peer_addr`]: Socket::peer_addr
+    ///
+    /// # Notes
+    ///
+    /// The pair is only returned if *both* queries succeed. If either query
+    /// fails no half snapshot is returned; instead an [`AddrPairError`] is
+    /// returned that records which query failed ([`AddrPairError::query`])
+    /// together with the original OS error ([`AddrPairError::io_error`]).
+    ///
+    /// This returns an error if the socket is not [`connect`ed], because the
+    /// peer address query fails on unconnected sockets.
+    ///
+    /// This function only queries the socket, it does not modify any socket
+    /// options.
+    ///
+    /// [`connect`ed]: Socket::connect
+    #[cfg(feature = "addr-pair")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "addr-pair")))]
+    pub fn addr_pair(&self) -> Result<(SockAddr, SockAddr), AddrPairError> {
+        let local_addr = self
+            .local_addr()
+            .map_err(|err| AddrPairError::new(AddrPairQuery::LocalAddr, err))?;
+        let peer_addr = self
+            .peer_addr()
+            .map_err(|err| AddrPairError::new(AddrPairQuery::PeerAddr, err))?;
+        Ok((local_addr, peer_addr))
+    }
+
     /// Returns the [`Type`] of this socket by checking the `SO_TYPE` option on
     /// this socket.
     pub fn r#type(&self) -> io::Result<Type> {
@@ -2519,6 +2555,79 @@ impl fmt::Debug for Socket {
             .field("local_addr", &self.local_addr().ok())
             .field("peer_addr", &self.peer_addr().ok())
             .finish()
+    }
+}
+
+/// Which address query of [`Socket::addr_pair`] failed.
+#[cfg(feature = "addr-pair")]
+#[cfg_attr(docsrs, doc(cfg(feature = "addr-pair")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddrPairQuery {
+    /// The local address query (`getsockname(2)`), see [`Socket::local_addr`].
+    LocalAddr,
+    /// The peer address query (`getpeername(2)`), see [`Socket::peer_addr`].
+    PeerAddr,
+}
+
+#[cfg(feature = "addr-pair")]
+impl fmt::Display for AddrPairQuery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            AddrPairQuery::LocalAddr => "local_addr",
+            AddrPairQuery::PeerAddr => "peer_addr",
+        };
+        f.write_str(name)
+    }
+}
+
+/// Error returned by [`Socket::addr_pair`].
+///
+/// Records which address query failed ([`AddrPairError::query`]) and keeps the
+/// original OS error ([`AddrPairError::io_error`]). Because the error is
+/// returned in place of the address pair, a failed query never yields a half
+/// (local-only or peer-only) snapshot.
+#[cfg(feature = "addr-pair")]
+#[cfg_attr(docsrs, doc(cfg(feature = "addr-pair")))]
+#[derive(Debug)]
+pub struct AddrPairError {
+    query: AddrPairQuery,
+    error: io::Error,
+}
+
+#[cfg(feature = "addr-pair")]
+impl AddrPairError {
+    pub(crate) fn new(query: AddrPairQuery, error: io::Error) -> AddrPairError {
+        AddrPairError { query, error }
+    }
+
+    /// Returns which address query of [`Socket::addr_pair`] failed.
+    pub fn query(&self) -> AddrPairQuery {
+        self.query
+    }
+
+    /// Returns a reference to the original OS error of the failed query.
+    pub fn io_error(&self) -> &io::Error {
+        &self.error
+    }
+
+    /// Consumes the error, returning the original OS error of the failed
+    /// query.
+    pub fn into_io_error(self) -> io::Error {
+        self.error
+    }
+}
+
+#[cfg(feature = "addr-pair")]
+impl fmt::Display for AddrPairError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} query failed: {}", self.query, self.error)
+    }
+}
+
+#[cfg(feature = "addr-pair")]
+impl std::error::Error for AddrPairError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
     }
 }
 

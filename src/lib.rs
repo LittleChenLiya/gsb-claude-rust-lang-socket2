@@ -49,8 +49,10 @@
 //!
 //! ## Features
 //!
-//! This crate has a single feature `all`, which enables all functions even ones
-//! that are not available on all OSs.
+//! This crate has a feature `all`, which enables all functions even ones
+//! that are not available on all OSs, and a feature `addr-pair`, which
+//! enables the paired local/peer address snapshot API
+//! (`Socket::addr_pair`). The `addr-pair` feature is also enabled by `all`.
 
 #![deny(missing_docs, missing_debug_implementations, rust_2018_idioms)]
 // Automatically generate required OS/features for docs.rs.
@@ -199,6 +201,8 @@ pub use sockaddr::{sa_family_t, socklen_t, SockAddr, SockAddrStorage};
 )))]
 pub use socket::InterfaceIndexOrAddress;
 pub use socket::Socket;
+#[cfg(feature = "addr-pair")]
+pub use socket::{AddrPairError, AddrPairQuery};
 pub use sockref::SockRef;
 #[cfg(all(feature = "all", target_os = "linux"))]
 pub use sys::CcidEndpoints;

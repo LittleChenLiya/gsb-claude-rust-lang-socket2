@@ -64,7 +64,9 @@ features = [
 
 [features]
 # Enable all API, even ones not available on all OSs.
-all = []
+all = ["addr-pair"]
+# Enable the `Socket::addr_pair` paired local/peer address snapshot API.
+addr-pair = []
 
 [package.metadata.cargo_check_external_types]
 allowed_external_types = [

@@ -2000,3 +2000,175 @@ fn min_hopcount_v6_preserves_outbound_hops() {
     assert_eq!(socket.min_hopcount_v6().unwrap(), 197);
     assert_eq!(socket.unicast_hops_v6().unwrap(), 61);
 }
+
+#[cfg(feature = "addr-pair")]
+mod addr_pair {
+    use super::*;
+    use socket2::{AddrPairQuery, SockRef};
+    use std::cell::Cell;
+
+    /// Spy that observes a socket around a `Socket::addr_pair` call. It
+    /// records the address queries it issues itself and snapshots socket
+    /// options before and after the call to prove `addr_pair` does not
+    /// modify any socket option.
+    struct AddrPairSpy<'a> {
+        socket: &'a Socket,
+        local_addr_queries: Cell<usize>,
+        peer_addr_queries: Cell<usize>,
+    }
+
+    /// Snapshot of a few socket options used to detect option changes.
+    #[derive(Debug, PartialEq, Eq)]
+    struct OptionSnapshot {
+        r#type: Type,
+        reuse_address: bool,
+        keepalive: bool,
+    }
+
+    impl<'a> AddrPairSpy<'a> {
+        fn new(socket: &'a Socket) -> AddrPairSpy<'a> {
+            AddrPairSpy {
+                socket,
+                local_addr_queries: Cell::new(0),
+                peer_addr_queries: Cell::new(0),
+            }
+        }
+
+        fn local_addr(&self) -> io::Result<SockAddr> {
+            self.local_addr_queries.set(self.local_addr_queries.get() + 1);
+            self.socket.local_addr()
+        }
+
+        fn peer_addr(&self) -> io::Result<SockAddr> {
+            self.peer_addr_queries.set(self.peer_addr_queries.get() + 1);
+            self.socket.peer_addr()
+        }
+
+        fn options(&self) -> OptionSnapshot {
+            OptionSnapshot {
+                r#type: self.socket.r#type().unwrap(),
+                reuse_address: self.socket.reuse_address().unwrap(),
+                keepalive: self.socket.keepalive().unwrap(),
+            }
+        }
+    }
+
+    /// The OS error a failed `getpeername` on an unconnected socket must
+    /// keep: `ENOTCONN` (Unix) / `WSAENOTCONN` (Windows).
+    fn not_connected_os_error() -> i32 {
+        #[cfg(unix)]
+        return libc::ENOTCONN;
+        #[cfg(windows)]
+        return windows_sys::Win32::Networking::WinSock::WSAENOTCONN as i32;
+    }
+
+    fn bound_tcp_listener() -> Socket {
+        let listener = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        listener
+            .bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+            .unwrap();
+        listener.listen(4).unwrap();
+        listener
+    }
+
+    #[test]
+    fn addr_pair_connected_loopback() {
+        let listener = bound_tcp_listener();
+        let client = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        client.connect(&listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+
+        // Both queries succeed: a full paired snapshot is returned.
+        let (client_local, client_peer) = client.addr_pair().unwrap();
+        assert_eq!(client_local.as_socket(), client.local_addr().unwrap().as_socket());
+        assert_eq!(client_peer.as_socket(), server.local_addr().unwrap().as_socket());
+
+        let (server_local, server_peer) = server.addr_pair().unwrap();
+        assert_eq!(server_local.as_socket(), server.local_addr().unwrap().as_socket());
+        assert_eq!(server_peer.as_socket(), client_local.as_socket());
+
+        // The two ends mirror each other.
+        assert_eq!(client_local.as_socket(), server_peer.as_socket());
+        assert_eq!(client_peer.as_socket(), server_local.as_socket());
+
+        // The same paired snapshot is reachable through `SockRef`, e.g. for
+        // a `std::net::TcpStream`.
+        let stream: TcpStream = server.into();
+        let sock_ref = SockRef::from(&stream);
+        let (ref_local, ref_peer) = sock_ref.addr_pair().unwrap();
+        assert_eq!(ref_local.as_socket(), server_local.as_socket());
+        assert_eq!(ref_peer.as_socket(), server_peer.as_socket());
+
+        // Small temp-file fixture: persist the snapshot and read it back.
+        let mut path = env::temp_dir();
+        path.push(format!("socket2-addr-pair-{}.txt", std::process::id()));
+        let report = format!(
+            "client local={} peer={}\nserver local={} peer={}\n",
+            client_local.as_socket().unwrap(),
+            client_peer.as_socket().unwrap(),
+            server_local.as_socket().unwrap(),
+            server_peer.as_socket().unwrap(),
+        );
+        fs::write(&path, &report).unwrap();
+        let read_back = fs::read_to_string(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        assert_eq!(read_back, report);
+        println!("addr_pair_connected_loopback report:\n{report}");
+    }
+
+    #[test]
+    fn addr_pair_unconnected_socket_rejected() {
+        // Bound (so `local_addr` works) but not connected: the peer address
+        // query must fail and the pair must be refused as a whole.
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        socket
+            .bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+            .unwrap();
+
+        let err = socket.addr_pair().unwrap_err();
+        assert_eq!(err.query(), AddrPairQuery::PeerAddr);
+        assert_eq!(err.io_error().kind(), io::ErrorKind::NotConnected);
+        assert_eq!(err.io_error().raw_os_error(), Some(not_connected_os_error()));
+        // The original OS error survives `into_io_error` as well.
+        assert_eq!(err.into_io_error().raw_os_error(), Some(not_connected_os_error()));
+    }
+
+    #[test]
+    fn addr_pair_second_query_failure_spy() {
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        socket
+            .bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+            .unwrap();
+        let spy = AddrPairSpy::new(&socket);
+
+        let options_before = spy.options();
+
+        // The first query alone succeeds at the OS level: a half snapshot
+        // (local address only) exists...
+        let half = spy.local_addr().unwrap();
+        assert!(half.as_socket_ipv4().is_some());
+        // ...and the second query alone fails.
+        let second_err = spy.peer_addr().unwrap_err();
+        assert_eq!(second_err.raw_os_error(), Some(not_connected_os_error()));
+
+        // `addr_pair` must not hand out the half snapshot: it returns no
+        // address at all, only the failed operation and the original OS
+        // error.
+        let err = socket.addr_pair().unwrap_err();
+        assert_eq!(err.query(), AddrPairQuery::PeerAddr);
+        assert_eq!(err.io_error().raw_os_error(), Some(not_connected_os_error()));
+        assert!(format!("{err}").contains("peer_addr"));
+
+        // The spy observed its own queries, and the failed `addr_pair` call
+        // did not change any socket option.
+        assert_eq!(spy.local_addr_queries.get(), 1);
+        assert_eq!(spy.peer_addr_queries.get(), 1);
+        assert_eq!(spy.options(), options_before);
+        println!(
+            "addr_pair_second_query_failure_spy: no half snapshot returned, \
+             failed query={}, os error={:?}, options unchanged",
+            err.query(),
+            err.io_error().raw_os_error()
+        );
+    }
+}
