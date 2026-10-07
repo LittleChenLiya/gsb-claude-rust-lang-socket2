@@ -580,6 +580,74 @@ fn connect_timeout_valid() {
         .unwrap();
 }
 
+/// Bind-and-drop helper: an ephemeral loopback TCP port with no listener.
+#[cfg(not(target_os = "wasi"))]
+fn unlistened_loopback_addr() -> SockAddr {
+    let probe = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    probe
+        .bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+        .unwrap();
+    let addr = probe.local_addr().unwrap();
+    drop(probe);
+    addr
+}
+
+/// Regression for the original `connect` interface alongside the connect
+/// diagnostic: on a platform-controlled unlistened loopback port the target
+/// address copy and OS error agree, and the plain interface keeps returning
+/// the exact same OS error code.
+#[test]
+#[cfg(not(target_os = "wasi"))]
+fn connect_diag_refused_matches_plain_connect() {
+    let addr = unlistened_loopback_addr();
+
+    let plain = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    let plain_err = plain.connect(&addr).unwrap_err();
+    assert_eq!(plain_err.kind(), io::ErrorKind::ConnectionRefused);
+
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    let err = socket.connect_diag(&addr).unwrap_err();
+
+    assert_eq!(err.operation(), "connect");
+    assert_eq!(err.address(), &addr);
+    assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+    assert_eq!(err.raw_os_error(), plain_err.raw_os_error());
+
+    // The address is an independent copy that survives the input address.
+    let saved = err.address().clone();
+    assert_eq!(saved, addr);
+    assert_eq!(saved.as_socket(), addr.as_socket());
+}
+
+/// A non-blocking connect to an unlistened loopback port must keep the
+/// in-progress return semantics rather than being reported as a final
+/// failure; the diagnostic keeps the same raw OS error as plain `connect`.
+#[test]
+#[cfg(not(target_os = "wasi"))]
+fn connect_diag_nonblocking_in_progress() {
+    let addr = unlistened_loopback_addr();
+
+    let plain = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    plain.set_nonblocking(true).unwrap();
+    let plain_err = plain.connect(&addr).unwrap_err();
+
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    socket.set_nonblocking(true).unwrap();
+    let err = socket.connect_diag(&addr).unwrap_err();
+
+    assert_eq!(err.operation(), "connect");
+    assert_eq!(err.address(), &addr);
+    assert_eq!(err.raw_os_error(), plain_err.raw_os_error());
+
+    if err.kind() == io::ErrorKind::WouldBlock {
+        // Simulated in-progress: same semantics as the plain interface, and
+        // not misreported as a final (refused/other) failure.
+        assert_eq!(plain_err.kind(), io::ErrorKind::WouldBlock);
+    } else {
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+    }
+}
+
 #[test]
 #[cfg(all(feature = "all", unix))]
 fn pair() {

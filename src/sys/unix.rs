@@ -1022,8 +1022,17 @@ pub(crate) fn bind(fd: RawSocket, addr: &SockAddr) -> io::Result<()> {
 }
 
 pub(crate) fn connect(fd: RawSocket, addr: &SockAddr) -> io::Result<()> {
+    // Test-only counter used to verify the connect diagnostic issues exactly
+    // one `connect(2)` call (no retries).
+    #[cfg(test)]
+    CONNECT_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     syscall!(connect(fd, addr.as_ptr().cast::<sockaddr>(), addr.len())).map(|_| ())
 }
+
+/// Number of `connect(2)` calls made through [`connect`]; test builds only.
+#[cfg(test)]
+pub(crate) static CONNECT_CALL_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 pub(crate) fn poll_connect(socket: &crate::Socket, timeout: Duration) -> io::Result<()> {
     let start = Instant::now();

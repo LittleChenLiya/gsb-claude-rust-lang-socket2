@@ -1,3 +1,12 @@
+# Unreleased
+
+* Added `Socket::connect_diag`, a diagnostic variant of `Socket::connect` that
+  on failure returns a `ConnectError` retaining a copy of the failed target
+  `SockAddr` and the operation name (`"connect"`), while the underlying OS
+  error code remains accessible. It performs the same single `connect(2)` call
+  without retries or socket-option changes; a non-blocking in-progress connect
+  keeps its original `WouldBlock`/`EINPROGRESS` return semantics.
+
 # 0.6.5
 
 * Add support for Emscripten (wasm32)

@@ -344,6 +344,10 @@ pub(crate) fn bind(socket: RawSocket, addr: &SockAddr) -> io::Result<()> {
 }
 
 pub(crate) fn connect(socket: RawSocket, addr: &SockAddr) -> io::Result<()> {
+    // Test-only counter used to verify the connect diagnostic issues exactly
+    // one `connect` call (no retries).
+    #[cfg(test)]
+    CONNECT_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     syscall!(
         connect(socket, addr.as_ptr().cast::<sockaddr>(), addr.len()),
         PartialEq::ne,
@@ -351,6 +355,11 @@ pub(crate) fn connect(socket: RawSocket, addr: &SockAddr) -> io::Result<()> {
     )
     .map(|_| ())
 }
+
+/// Number of `connect` calls made through [`connect`]; test builds only.
+#[cfg(test)]
+pub(crate) static CONNECT_CALL_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 pub(crate) fn poll_connect(socket: &crate::Socket, timeout: Duration) -> io::Result<()> {
     let start = Instant::now();

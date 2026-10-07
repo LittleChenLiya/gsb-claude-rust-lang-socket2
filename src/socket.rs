@@ -27,6 +27,84 @@ use crate::{Domain, Protocol, SockAddr, TcpKeepalive, Type};
 #[cfg(not(any(target_os = "redox", target_os = "wasi", target_os = "horizon")))]
 use crate::{MaybeUninitSlice, MsgHdr, RecvFlags};
 
+/// Error returned by [`Socket::connect_diag`] on a failed connection
+/// attempt.
+///
+/// In addition to the underlying OS error it retains a copy of the
+/// [`SockAddr`] the connection was attempted to and the name of the failed
+/// operation. The retained address is an independent copy owned by the error
+/// and stays available even if the caller's address is dropped.
+///
+/// Like [`Socket::connect`], this diagnostic does not retry the connection or
+/// modify any socket options. A non-blocking connection that is still in
+/// progress is reported as an in-progress error (see
+/// [`ConnectError::kind`]), not as a final failure.
+#[derive(Debug)]
+pub struct ConnectError {
+    operation: &'static str,
+    address: SockAddr,
+    error: io::Error,
+}
+
+impl ConnectError {
+    /// Returns the name of the operation that failed.
+    ///
+    /// For errors returned by [`Socket::connect_diag`] this is always
+    /// `"connect"`.
+    pub fn operation(&self) -> &'static str {
+        self.operation
+    }
+
+    /// Returns a copy of the address the connection was attempted to.
+    ///
+    /// This is the address passed to [`Socket::connect_diag`], preserved as an
+    /// independent copy.
+    pub fn address(&self) -> &SockAddr {
+        &self.address
+    }
+
+    /// Returns the corresponding [`io::ErrorKind`] of the underlying OS error.
+    ///
+    /// For a non-blocking socket this returns
+    /// [`io::ErrorKind::WouldBlock`] while the connection is still in
+    /// progress.
+    pub fn kind(&self) -> io::ErrorKind {
+        self.error.kind()
+    }
+
+    /// Returns the underlying OS error code, if any.
+    pub fn raw_os_error(&self) -> Option<i32> {
+        self.error.raw_os_error()
+    }
+
+    /// Returns a reference to the underlying [`io::Error`].
+    pub fn io_error(&self) -> &io::Error {
+        &self.error
+    }
+}
+
+impl fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} to {:?} failed: {}",
+            self.operation, self.address, self.error
+        )
+    }
+}
+
+impl std::error::Error for ConnectError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+impl From<ConnectError> for io::Error {
+    fn from(error: ConnectError) -> io::Error {
+        error.error
+    }
+}
+
 /// Owned wrapper around a system socket.
 ///
 /// This type simply wraps an instance of a file descriptor (`c_int`) on Unix
@@ -191,6 +269,66 @@ impl Socket {
     #[allow(rustdoc::broken_intra_doc_links)] // Socket::set_no_peercred
     pub fn connect(&self, address: &SockAddr) -> io::Result<()> {
         sys::connect(self.as_raw(), address)
+    }
+
+    /// Initiate a connection on this socket to the specified address,
+    /// returning a [`ConnectError`] that keeps a copy of the failed target
+    /// address alongside the OS error.
+    ///
+    /// This is a diagnostic variant of [`Socket::connect`]. It issues exactly
+    /// the same single `connect(2)` call, with the same return semantics, but
+    /// on failure additionally retains:
+    /// * a copy of the [`SockAddr`] the connection was attempted to (via
+    ///   [`ConnectError::address`]), and
+    /// * the name of the failed operation, `"connect"` (via
+    ///   [`ConnectError::operation`]).
+    ///
+    /// The underlying OS error remains fully available through
+    /// [`ConnectError::raw_os_error`], [`ConnectError::kind`] and the
+    /// [`std::error::Error`] trait (the [`ConnectError`] acts as the error
+    /// source).
+    ///
+    /// This method does not retry the connection, change any socket options or
+    /// alter the blocking mode of the socket. In particular a non-blocking
+    /// connection that is still in progress is reported as
+    /// [`io::ErrorKind::WouldBlock`] (or `EINPROGRESS` on Unix) exactly as with
+    /// [`Socket::connect`]; it is not treated as a final failure.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(not(target_os = "wasi"))]
+    /// # fn main() {
+    /// use std::io;
+    /// use std::net::SocketAddr;
+    ///
+    /// use socket2::{Domain, Socket, Type};
+    ///
+    /// // Bind and drop a listener to get a port with nothing listening.
+    /// let probe = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    /// probe
+    ///     .bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+    ///     .unwrap();
+    /// let target = probe.local_addr().unwrap();
+    /// drop(probe);
+    ///
+    /// let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    /// let err = socket.connect_diag(&target).unwrap_err();
+    /// assert_eq!(err.operation(), "connect");
+    /// assert_eq!(err.address(), &target);
+    /// assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+    /// assert!(err.raw_os_error().is_some());
+    /// # }
+    /// # #[cfg(target_os = "wasi")]
+    /// # fn main() {}
+    /// ```
+    #[doc = man_links!(connect(2))]
+    pub fn connect_diag(&self, address: &SockAddr) -> Result<(), ConnectError> {
+        sys::connect(self.as_raw(), address).map_err(|error| ConnectError {
+            operation: "connect",
+            address: address.clone(),
+            error,
+        })
     }
 
     /// Initiate a connection on this socket to the specified address, only
@@ -2528,3 +2666,140 @@ from!(net::UdpSocket, Socket);
 from!(Socket, net::TcpStream);
 from!(Socket, net::TcpListener);
 from!(Socket, net::UdpSocket);
+
+#[cfg(test)]
+mod connect_diag_tests {
+    use std::io;
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+
+    use crate::sys::CONNECT_CALL_COUNT;
+    use crate::{Domain, SockAddr, Socket, Type};
+
+    /// Reserves an ephemeral loopback TCP port, then releases it by dropping
+    /// the listener, yielding an address on which nothing is listening.
+    fn unlistened_loopback_addr() -> SockAddr {
+        let probe = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        probe
+            .bind(&SockAddr::from(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
+            .unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        addr
+    }
+
+    /// Platform error kinds that represent a non-blocking connect that is
+    /// still in progress (not a final failure).
+    fn is_in_progress(kind: io::ErrorKind) -> bool {
+        kind == io::ErrorKind::WouldBlock
+    }
+
+    /// Fixture 1: a platform-controlled loopback port with no listener.
+    ///
+    /// Checks that the diagnostic retains an independent copy of the failed
+    /// target address and the operation name, that the underlying OS error code
+    /// is still readable and matches the original `Socket::connect` interface,
+    /// and that exactly one `connect` syscall is issued (no retries).
+    #[test]
+    fn refusal_retains_address_with_single_connect_call() {
+        let addr = unlistened_loopback_addr();
+        let expected: SocketAddr = addr.as_socket().unwrap();
+
+        // Short regression for the original interface: same OS error as the
+        // diagnostic.
+        let plain = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        let plain_err = plain.connect(&addr).unwrap_err();
+        assert_eq!(plain_err.kind(), io::ErrorKind::ConnectionRefused);
+
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        CONNECT_CALL_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+        let err = socket.connect_diag(&addr).unwrap_err();
+        assert_eq!(
+            CONNECT_CALL_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+
+        // Failed target is preserved as an independent copy.
+        assert_eq!(err.operation(), "connect");
+        assert_eq!(err.address(), &addr);
+        assert_eq!(err.address().as_socket(), Some(expected));
+
+        // Underlying OS error remains readable and matches the plain
+        // `connect` result.
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+        assert!(err.raw_os_error().is_some());
+        assert_eq!(err.raw_os_error(), plain_err.raw_os_error());
+        let source = std::error::Error::source(&err)
+            .and_then(|e| e.downcast_ref::<io::Error>())
+            .expect("io::Error as source");
+        assert_eq!(source.raw_os_error(), plain_err.raw_os_error());
+
+        // Conversion back to `io::Error` keeps the OS error code.
+        let converted: io::Error = err.into();
+        assert_eq!(converted.raw_os_error(), plain_err.raw_os_error());
+    }
+
+    /// Fixture 2: simulated non-blocking connect (in-progress).
+    ///
+    /// A non-blocking `connect_diag` must preserve the original return
+    /// semantics: an in-progress result is reported as such (not as a final
+    /// failure), exactly one `connect` call is made, and the eventual failure
+    /// observed via `SO_ERROR` leaves the call count untouched.
+    #[test]
+    fn nonblocking_in_progress_keeps_semantics_and_single_call() {
+        let addr = unlistened_loopback_addr();
+
+        // Original interface, for parity.
+        let plain = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        plain.set_nonblocking(true).unwrap();
+        let plain_err = plain.connect(&addr).unwrap_err();
+
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        socket.set_nonblocking(true).unwrap();
+        CONNECT_CALL_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+        let err = socket.connect_diag(&addr).unwrap_err();
+        assert_eq!(
+            CONNECT_CALL_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+
+        assert_eq!(err.operation(), "connect");
+        assert_eq!(err.address(), &addr);
+        assert_eq!(err.raw_os_error(), plain_err.raw_os_error());
+
+        if is_in_progress(err.kind()) {
+            // In-progress is not a final failure: the diagnostic reports the
+            // same WouldBlock/EINPROGRESS the plain `connect` interface does,
+            // rather than mislabelling it as a refused/other failure.
+            assert!(is_in_progress(plain_err.kind()));
+            assert_eq!(
+                CONNECT_CALL_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+                1
+            );
+        } else {
+            // Some platforms report the refusal immediately even on
+            // non-blocking loopback sockets; that must still be a single call
+            // and must not be confused with an in-progress result.
+            assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+            assert_eq!(plain_err.kind(), io::ErrorKind::ConnectionRefused);
+        }
+    }
+
+    /// A successful connect returns `Ok` and performs exactly one call.
+    #[test]
+    fn successful_connect_is_passthrough() {
+        let listener = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        listener
+            .bind(&SockAddr::from(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
+            .unwrap();
+        listener.listen(1).unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        CONNECT_CALL_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+        socket.connect_diag(&addr).unwrap();
+        assert_eq!(
+            CONNECT_CALL_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+}

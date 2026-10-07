@@ -189,6 +189,7 @@ compile_error!("Socket2 doesn't support the compile target");
 use sys::c_int;
 
 pub use sockaddr::{sa_family_t, socklen_t, SockAddr, SockAddrStorage};
+pub use socket::ConnectError;
 #[cfg(not(any(
     target_os = "haiku",
     target_os = "illumos",
