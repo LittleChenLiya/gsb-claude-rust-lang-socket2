@@ -2000,3 +2000,137 @@ fn min_hopcount_v6_preserves_outbound_hops() {
     assert_eq!(socket.min_hopcount_v6().unwrap(), 197);
     assert_eq!(socket.unicast_hops_v6().unwrap(), 61);
 }
+
+// ===========================================================================
+// `pair-snapshot` feature: paired local/peer address snapshot.
+// ===========================================================================
+
+/// Error code reported by `getpeername(2)`/`getpeername` on an unconnected
+/// socket.
+#[cfg(all(
+    feature = "pair-snapshot",
+    any(unix, all(target_os = "wasi", not(target_env = "p1")))
+))]
+const EXPECTED_NOT_CONNECTED: i32 = libc::ENOTCONN;
+#[cfg(all(feature = "pair-snapshot", windows))]
+const EXPECTED_NOT_CONNECTED: i32 = windows_sys::Win32::Networking::WinSock::WSAENOTCONN as i32;
+
+/// A local loopback connection must return the matched address pair: the
+/// client's local address is the address the accepted socket reports as its
+/// peer and vice versa.
+#[cfg(feature = "pair-snapshot")]
+#[test]
+fn addr_pair_loopback_matches_both_halves() {
+    let listener = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    listener.bind(&any_ipv4()).unwrap();
+    listener.listen(1).unwrap();
+    let listener_addr = listener.local_addr().unwrap();
+
+    let client = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    client.connect(&listener_addr).unwrap();
+
+    let (accepted, accepted_peer) = listener.accept().unwrap();
+
+    // Paired snapshot of the client side.
+    let client_pair = client
+        .addr_pair()
+        .expect("connected client yields a full address pair");
+    // Paired snapshot of the accepted server side.
+    let server_pair = accepted
+        .addr_pair()
+        .expect("accepted socket yields a full address pair");
+
+    let (client_local, client_peer) = (
+        client_pair.local_addr().as_socket().unwrap(),
+        client_pair.peer_addr().as_socket().unwrap(),
+    );
+    let (server_local, server_peer) = (
+        server_pair.local_addr().as_socket().unwrap(),
+        server_pair.peer_addr().as_socket().unwrap(),
+    );
+
+    println!("client pair: local={client_local}, peer={client_peer}");
+    println!("server pair: local={server_local}, peer={server_peer}");
+
+    // Both queries succeeded against loopback, so the pairs must cross-match.
+    assert_eq!(client_peer, server_local);
+    assert_eq!(server_peer, client_local);
+    // `accept` reported the same remote address as the snapshot's peer.
+    assert_eq!(client_local, accepted_peer.as_socket().unwrap());
+    assert_eq!(client_peer, listener_addr.as_socket().unwrap());
+}
+
+/// Taking the snapshot does not modify socket options.
+#[cfg(feature = "pair-snapshot")]
+#[test]
+fn addr_pair_does_not_change_socket_options() {
+    let listener = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    listener.bind(&any_ipv4()).unwrap();
+    listener.listen(1).unwrap();
+
+    let client = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    client.set_reuse_address(true).unwrap();
+    client.set_tcp_nodelay(true).unwrap();
+    client.connect(&listener.local_addr().unwrap()).unwrap();
+    let accepted = listener.accept().unwrap().0;
+
+    for socket in [&client, &accepted] {
+        let opts_before = (
+            socket.r#type().unwrap(),
+            socket.reuse_address().unwrap(),
+            socket.tcp_nodelay().unwrap(),
+        );
+
+        let pair = socket.addr_pair().unwrap();
+        assert!(pair.local_addr().as_socket().is_some());
+        assert!(pair.peer_addr().as_socket().is_some());
+
+        let opts_after = (
+            socket.r#type().unwrap(),
+            socket.reuse_address().unwrap(),
+            socket.tcp_nodelay().unwrap(),
+        );
+        assert_eq!(
+            opts_before, opts_after,
+            "addr_pair must not change socket options"
+        );
+    }
+}
+
+/// A bound-but-unconnected socket is rejected: the local query succeeds, then
+/// the peer query fails with the original OS "not connected" error and no pair
+/// is returned.
+#[cfg(all(
+    feature = "pair-snapshot",
+    any(unix, windows, all(target_os = "wasi", not(target_env = "p1")))
+))]
+#[test]
+fn addr_pair_unconnected_socket_rejected() {
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    socket.bind(&any_ipv4()).unwrap();
+
+    let error = socket
+        .addr_pair()
+        .expect_err("unconnected socket must not yield a pair");
+
+    assert!(error.is_peer_addr());
+    assert!(!error.is_local_addr());
+    assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+    assert_eq!(
+        error.raw_os_error(),
+        Some(EXPECTED_NOT_CONNECTED),
+        "original OS error must be preserved"
+    );
+    assert_eq!(
+        error.into_io_error().raw_os_error(),
+        Some(EXPECTED_NOT_CONNECTED)
+    );
+}
+
+/// A completely fresh socket must never produce a half-filled snapshot either.
+#[cfg(feature = "pair-snapshot")]
+#[test]
+fn addr_pair_fresh_socket_rejected() {
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    assert!(socket.addr_pair().is_err());
+}

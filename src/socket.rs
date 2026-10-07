@@ -333,6 +333,30 @@ impl Socket {
         sys::getpeername(self.as_raw())
     }
 
+    /// Returns a paired snapshot of the socket's local address and remote peer
+    /// address.
+    ///
+    /// This queries the local half of the socket using [`local_addr`]
+    /// (`getsockname(2)`) followed by the remote peer using [`peer_addr`]
+    /// (`getpeername(2)`). A pair is only returned when **both** queries
+    /// succeed; if either query fails no half-filled snapshot is produced. The
+    /// returned [`AddrPairError`] keeps the operation that failed
+    /// ([`local_addr`](AddrPairError::is_local_addr) versus
+    /// [`peer_addr`](AddrPairError::is_peer_addr)) together with the original
+    /// OS error, so [`io::Error::raw_os_error`] and [`io::Error::kind`] report
+    /// the values returned by the failed system call.
+    ///
+    /// In particular an unconnected socket, for which `getpeername(2)` fails,
+    /// is rejected with the OS's "not connected" error and no socket options
+    /// are modified.
+    ///
+    /// [`local_addr`]: Socket::local_addr
+    /// [`peer_addr`]: Socket::peer_addr
+    #[cfg(feature = "pair-snapshot")]
+    pub fn addr_pair(&self) -> Result<AddrPair, AddrPairError> {
+        addr_pair_snapshot(self)
+    }
+
     /// Returns the [`Type`] of this socket by checking the `SO_TYPE` option on
     /// this socket.
     pub fn r#type(&self) -> io::Result<Type> {
@@ -862,6 +886,136 @@ pub enum InterfaceIndexOrAddress {
     Index(u32),
     /// An address assigned to an interface.
     Address(Ipv4Addr),
+}
+
+/// A paired snapshot of a socket's local address and remote peer address.
+///
+/// This is returned by [`Socket::addr_pair`], which is only available with
+/// the `pair-snapshot` feature enabled. It is only produced when both the
+/// local address and the peer address were retrieved successfully, hence it
+/// never holds a half-filled result.
+#[cfg(feature = "pair-snapshot")]
+#[derive(Clone, Debug)]
+pub struct AddrPair {
+    /// Local half of the connection (`getsockname(2)`).
+    local: SockAddr,
+    /// Remote half of the connection (`getpeername(2)`).
+    peer: SockAddr,
+}
+
+#[cfg(feature = "pair-snapshot")]
+impl AddrPair {
+    /// Returns the address of the local half of the socket.
+    ///
+    /// This is the address retrieved using [`Socket::local_addr`].
+    pub fn local_addr(&self) -> &SockAddr {
+        &self.local
+    }
+
+    /// Returns the address of the remote peer of the socket.
+    ///
+    /// This is the address retrieved using [`Socket::peer_addr`].
+    pub fn peer_addr(&self) -> &SockAddr {
+        &self.peer
+    }
+}
+
+/// The address query that failed while taking an [`AddrPair`] snapshot.
+///
+/// Returned by [`AddrPairError::op`].
+#[cfg(feature = "pair-snapshot")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum AddrPairOp {
+    /// Retrieving the local address failed, i.e. the
+    /// [`Socket::local_addr`]/`getsockname(2)` query.
+    LocalAddr,
+    /// Retrieving the peer address failed, i.e. the
+    /// [`Socket::peer_addr`]/`getpeername(2)` query.
+    PeerAddr,
+}
+
+/// Error returned by [`Socket::addr_pair`] when one of the two address
+/// queries failed.
+///
+/// The pair is returned all-or-nothing: if either [`Socket::local_addr`] or
+/// [`Socket::peer_addr`] fails, no [`AddrPair`] is produced. This error keeps
+/// the [`operation`](AddrPairError::op) that failed together with the original
+/// OS error, accessible through [`raw_os_error`](AddrPairError::raw_os_error),
+/// [`kind`](AddrPairError::kind) or [`as_io_error`](AddrPairError::as_io_error).
+#[cfg(feature = "pair-snapshot")]
+#[derive(Debug)]
+pub struct AddrPairError {
+    /// The query that failed.
+    op: AddrPairOp,
+    /// The original error returned by the failed system call.
+    source: io::Error,
+}
+
+#[cfg(feature = "pair-snapshot")]
+impl AddrPairError {
+    /// Returns which address query failed.
+    pub fn op(&self) -> AddrPairOp {
+        self.op
+    }
+
+    /// Returns `true` if retrieving the local address
+    /// ([`Socket::local_addr`]) failed.
+    pub fn is_local_addr(&self) -> bool {
+        self.op == AddrPairOp::LocalAddr
+    }
+
+    /// Returns `true` if retrieving the peer address
+    /// ([`Socket::peer_addr`]) failed.
+    pub fn is_peer_addr(&self) -> bool {
+        self.op == AddrPairOp::PeerAddr
+    }
+
+    /// Returns the [`io::ErrorKind`] of the original OS error.
+    pub fn kind(&self) -> io::ErrorKind {
+        self.source.kind()
+    }
+
+    /// Returns the raw OS error code of the failed system call, if any.
+    ///
+    /// This delegates to [`io::Error::raw_os_error`], so the original OS error
+    /// (e.g. `ENOTCONN` on Unix or `WSAENOTCONN` on Windows) is preserved.
+    pub fn raw_os_error(&self) -> Option<i32> {
+        self.source.raw_os_error()
+    }
+
+    /// Borrows the original OS error produced by the failed address query.
+    pub fn as_io_error(&self) -> &io::Error {
+        &self.source
+    }
+
+    /// Consumes the error and returns the original OS error produced by the
+    /// failed address query.
+    pub fn into_io_error(self) -> io::Error {
+        self.source
+    }
+}
+
+#[cfg(feature = "pair-snapshot")]
+impl fmt::Display for AddrPairError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let op = match self.op {
+            AddrPairOp::LocalAddr => "local address (getsockname)",
+            AddrPairOp::PeerAddr => "peer address (getpeername)",
+        };
+        write!(
+            f,
+            "failed to retrieve socket {op} for the address pair snapshot: {}",
+            self.source
+        )
+    }
+}
+
+#[cfg(feature = "pair-snapshot")]
+impl std::error::Error for AddrPairError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 /// Socket options get/set using `SOL_SOCKET`.
@@ -2528,3 +2682,216 @@ from!(net::UdpSocket, Socket);
 from!(Socket, net::TcpStream);
 from!(Socket, net::TcpListener);
 from!(Socket, net::UdpSocket);
+
+/// Source of the two addresses making up an [`AddrPair`] snapshot.
+///
+/// Implemented for [`Socket`] using `getsockname(2)` and `getpeername(2)`; the
+/// abstraction lets the paired-snapshot logic be exercised with a spy in unit
+/// tests without changing any socket state.
+#[cfg(feature = "pair-snapshot")]
+trait SnapshotAddrs {
+    /// Query the local half of the socket (`getsockname(2)`).
+    fn snapshot_local_addr(&self) -> io::Result<SockAddr>;
+
+    /// Query the remote peer of the socket (`getpeername(2)`).
+    fn snapshot_peer_addr(&self) -> io::Result<SockAddr>;
+}
+
+#[cfg(feature = "pair-snapshot")]
+impl SnapshotAddrs for Socket {
+    fn snapshot_local_addr(&self) -> io::Result<SockAddr> {
+        self.local_addr()
+    }
+
+    fn snapshot_peer_addr(&self) -> io::Result<SockAddr> {
+        self.peer_addr()
+    }
+}
+
+/// Take an all-or-nothing paired snapshot of the local and peer addresses.
+///
+/// The local address is queried first; only if that succeeds is the peer
+/// address queried. Any failure is reported together with the operation that
+/// failed and the original OS error, and no half-filled pair is produced. No
+/// socket options are read or modified beyond the two address queries.
+#[cfg(feature = "pair-snapshot")]
+fn addr_pair_snapshot<A: SnapshotAddrs + ?Sized>(addrs: &A) -> Result<AddrPair, AddrPairError> {
+    let local = addrs
+        .snapshot_local_addr()
+        .map_err(|source| AddrPairError {
+            op: AddrPairOp::LocalAddr,
+            source,
+        })?;
+    let peer = addrs.snapshot_peer_addr().map_err(|source| AddrPairError {
+        op: AddrPairOp::PeerAddr,
+        source,
+    })?;
+    Ok(AddrPair { local, peer })
+}
+
+#[cfg(all(test, feature = "pair-snapshot"))]
+mod pair_snapshot_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    /// OS error code reported by `getpeername(2)` on an unconnected socket.
+    #[cfg(any(unix, all(target_os = "wasi", not(target_env = "p1"))))]
+    const ENOTCONN: i32 = libc::ENOTCONN;
+    /// OS error code reported by `getpeername` on an unconnected socket.
+    #[cfg(windows)]
+    const ENOTCONN: i32 = windows_sys::Win32::Networking::WinSock::WSAENOTCONN as i32;
+
+    /// Spy recording which address queries ran and which ones must fail.
+    ///
+    /// `fail_local`/`fail_peer` force the corresponding query to fail with the
+    /// supplied error while still returning a valid address on success, so the
+    /// all-or-nothing semantics can be observed.
+    struct AddrQuerySpy {
+        local_calls: Cell<usize>,
+        peer_calls: Cell<usize>,
+        fail_local: bool,
+        fail_peer: bool,
+    }
+
+    impl AddrQuerySpy {
+        fn new(fail_local: bool, fail_peer: bool) -> AddrQuerySpy {
+            AddrQuerySpy {
+                local_calls: Cell::new(0),
+                peer_calls: Cell::new(0),
+                fail_local,
+                fail_peer,
+            }
+        }
+
+        fn local_calls(&self) -> usize {
+            self.local_calls.get()
+        }
+
+        fn peer_calls(&self) -> usize {
+            self.peer_calls.get()
+        }
+    }
+
+    fn loopback_local_addr() -> SockAddr {
+        SockAddr::from(std::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+    }
+
+    fn loopback_peer_addr() -> SockAddr {
+        SockAddr::from(std::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9))
+    }
+
+    fn not_connected_error() -> io::Error {
+        io::Error::from_raw_os_error(ENOTCONN)
+    }
+
+    impl SnapshotAddrs for AddrQuerySpy {
+        fn snapshot_local_addr(&self) -> io::Result<SockAddr> {
+            self.local_calls.set(self.local_calls.get() + 1);
+            if self.fail_local {
+                Err(not_connected_error())
+            } else {
+                Ok(loopback_local_addr())
+            }
+        }
+
+        fn snapshot_peer_addr(&self) -> io::Result<SockAddr> {
+            self.peer_calls.set(self.peer_calls.get() + 1);
+            if self.fail_peer {
+                Err(not_connected_error())
+            } else {
+                Ok(loopback_peer_addr())
+            }
+        }
+    }
+
+    #[test]
+    fn spy_both_queries_succeed_returns_pair() {
+        let spy = AddrQuerySpy::new(false, false);
+        let pair = addr_pair_snapshot(&spy).expect("both queries succeed");
+        assert_eq!(spy.local_calls(), 1);
+        assert_eq!(spy.peer_calls(), 1);
+        assert_eq!(
+            pair.local_addr().as_socket(),
+            Some(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                Ipv4Addr::LOCALHOST,
+                0
+            )))
+        );
+        assert_eq!(
+            pair.peer_addr().as_socket(),
+            Some(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                Ipv4Addr::LOCALHOST,
+                9
+            )))
+        );
+    }
+
+    /// If the *second* query (peer address) fails, no half-filled snapshot is
+    /// returned; the failed operation and the original OS error are preserved.
+    #[test]
+    fn spy_second_query_failure_returns_no_half_snapshot() {
+        let spy = AddrQuerySpy::new(false, true);
+        let err = addr_pair_snapshot(&spy).expect_err("peer query fails");
+
+        // The local query ran and succeeded, the peer query ran and failed.
+        assert_eq!(spy.local_calls(), 1);
+        assert_eq!(spy.peer_calls(), 1);
+
+        // No pair is produced; the failure is attributed to the peer query.
+        assert!(err.is_peer_addr());
+        assert!(!err.is_local_addr());
+        assert_eq!(err.op(), AddrPairOp::PeerAddr);
+
+        // The original OS error (ENOTCONN/WSAENOTCONN) and its kind survive.
+        assert_eq!(err.raw_os_error(), Some(ENOTCONN));
+        assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+        assert_eq!(
+            err.as_io_error().raw_os_error(),
+            Some(ENOTCONN),
+            "original OS error must be retained"
+        );
+    }
+
+    /// If the *first* query (local address) fails, the second query must not
+    /// run at all and the failure is reported with the original OS error.
+    #[test]
+    fn spy_first_query_failure_skips_second_query() {
+        let spy = AddrQuerySpy::new(true, false);
+        let err = addr_pair_snapshot(&spy).expect_err("local query fails");
+
+        assert_eq!(spy.local_calls(), 1);
+        assert_eq!(spy.peer_calls(), 0, "peer query must never be attempted");
+
+        assert!(err.is_local_addr());
+        assert_eq!(err.op(), AddrPairOp::LocalAddr);
+        assert_eq!(err.raw_os_error(), Some(ENOTCONN));
+        assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+    }
+
+    /// A bound-but-unconnected real socket is rejected explicitly: the local
+    /// query succeeds, then the peer query fails with the OS's "not connected"
+    /// error and no pair is produced.
+    #[test]
+    fn unconnected_socket_is_rejected() {
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        socket
+            .bind(&SockAddr::from(std::net::SocketAddrV4::new(
+                Ipv4Addr::LOCALHOST,
+                0,
+            )))
+            .unwrap();
+        let err = socket.addr_pair().expect_err("unconnected socket");
+        assert!(err.is_peer_addr());
+        assert!(!err.is_local_addr());
+        assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+        assert_eq!(err.raw_os_error(), Some(ENOTCONN));
+    }
+
+    /// Even a completely fresh (unbound, unconnected) socket never yields a
+    /// half-filled snapshot.
+    #[test]
+    fn fresh_socket_is_rejected_without_pair() {
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        assert!(socket.addr_pair().is_err());
+    }
+}

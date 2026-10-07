@@ -49,8 +49,11 @@
 //!
 //! ## Features
 //!
-//! This crate has a single feature `all`, which enables all functions even ones
-//! that are not available on all OSs.
+//! * `pair-snapshot`, enables [`Socket::addr_pair`], returning a paired
+//!   snapshot of a socket's local and peer addresses only when both queries
+//!   succeed.
+//! * `all`, enables all functions even ones that are not available on all
+//!   OSs (this includes `pair-snapshot`).
 
 #![deny(missing_docs, missing_debug_implementations, rust_2018_idioms)]
 // Automatically generate required OS/features for docs.rs.

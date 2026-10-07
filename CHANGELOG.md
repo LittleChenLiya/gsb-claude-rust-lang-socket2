@@ -1,3 +1,13 @@
+# Unreleased
+
+* Added `Socket::addr_pair`, behind the new `pair-snapshot` feature, returning
+  a paired snapshot of the socket's local and peer addresses. A pair is only
+  returned when both `getsockname(2)` and `getpeername(2)` succeed; a failure
+  reports the failed operation (`local_addr` or `peer_addr`) together with the
+  original OS error via `AddrPairError`. Unconnected sockets are rejected and
+  no socket options are modified. The feature is also enabled by `all`; when it
+  is disabled the existing `local_addr`/`peer_addr` interface is unchanged.
+
 # 0.6.5
 
 * Add support for Emscripten (wasm32)

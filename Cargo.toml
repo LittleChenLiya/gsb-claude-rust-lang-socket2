@@ -63,8 +63,15 @@ features = [
 ]
 
 [features]
+# Enable `Socket::addr_pair`, returning a paired snapshot of the socket's local
+# and peer addresses only when both queries succeed.
+pair-snapshot = []
 # Enable all API, even ones not available on all OSs.
-all = []
+all = ["pair-snapshot"]
+
+[[example]]
+name = "addr_pair_demo"
+required-features = ["pair-snapshot"]
 
 [package.metadata.cargo_check_external_types]
 allowed_external_types = [
